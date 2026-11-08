@@ -30,7 +30,6 @@ jobs:
         run: |
           set -uo pipefail
           sudo apt-get update -qq
-          # 22.04 和 24.04 包名不同（24.04 加 t64 后缀），两个名字都试
           for p in xvfb libnss3 libdrm2 libxkbcommon0 libgbm1 fonts-liberation \
                    libglib2.0-0 libglib2.0-0t64 libatk1.0-0 libatk1.0-0t64 \
                    libatk-bridge2.0-0 libatk-bridge2.0-0t64 libcups2 libcups2t64 \
@@ -45,14 +44,14 @@ jobs:
           VLESS_NODE: ${{ secrets.VLESS_NODE }}
         run: |
           set -euo pipefail
-          trap 'rm -f xray.zip xray config.json xray.log' EXIT
 
           # 安装工具
           sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq jq netcat-openbsd >/dev/null 2>&1
 
-          # 下载 Xray
+          # 下载并解压 Xray
           curl -sL --fail -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          unzip -q xray.zip xray && chmod +x xray
+          unzip -q -o xray.zip xray && chmod +x xray
+          rm -f xray.zip
 
           # 检查 VLESS_NODE
           if [ -z "$VLESS_NODE" ]; then
@@ -61,47 +60,54 @@ jobs:
           fi
           echo "🔄 正在解析 VLESS 链接..."
 
-          # 生成配置（引用外部脚本）
+          # 生成配置
           python3 generate_xray_config.py > config.json
 
-          # 验证配置
+          # 验证配置合法性
           if ! jq . config.json >/dev/null 2>&1; then
-            echo "❌ 生成的配置无效"
+            echo "❌ 生成的 Xray 配置无效:"
             cat config.json
             exit 1
           fi
           
           NODE_ADDR=$(jq -r '.outbounds[0].settings.vnext[0].address' config.json)
           NODE_PORT=$(jq -r '.outbounds[0].settings.vnext[0].port' config.json)
-          echo "✅ 配置生成成功: ${NODE_ADDR}:${NODE_PORT}"
+          echo "✅ 节点配置已生成: ${NODE_ADDR}:${NODE_PORT}"
 
-          # 启动 Xray
-          ./xray run -c config.json > xray.log 2>&1 &
+          # 后台常驻启动 Xray
+          nohup ./xray run -c config.json > xray.log 2>&1 &
           XRAY_PID=$!
           echo "XRAY_PID=$XRAY_PID" >> $GITHUB_ENV
 
-          # 等待端口就绪
+          # 等待本地 SOCKS 端口就绪
           for i in {1..30}; do
             if nc -z 127.0.0.1 10808 2>/dev/null; then
-              echo "✅ 代理端口已就绪 (耗时 ${i} 秒)"
+              echo "✅ 本地代理端口已就绪 (耗时 ${i} 秒)"
               break
             fi
             sleep 1
           done
           
           if ! nc -z 127.0.0.1 10808 2>/dev/null; then
-            echo "❌ 端口未就绪，Xray 日志："
-            tail -20 xray.log
+            echo "❌ 端口未就绪，Xray 日志:"
+            cat xray.log
             exit 1
           fi
 
-          # 测试代理
-          echo "🔄 测试代理连接..."
-          PROXY_IP=$(curl -s --max-time 10 --socks5 127.0.0.1:10808 ifconfig.me 2>/dev/null || echo "")
-          if [ -n "$PROXY_IP" ]; then
-            echo "✅ 代理工作正常，出口 IP: $PROXY_IP"
-          else
-            echo "⚠️ 代理测试失败（可能目标网站不可达，继续执行）"
+          # 测试代理出口连通性（使用远程 DNS 解析 --socks5-hostname）
+          echo "🔄 测试代理出口连通性..."
+          PROXY_IP=""
+          for target in "https://api.ipify.org" "https://cloudflare.com/cdn-cgi/trace"; do
+            PROXY_IP=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:10808 "$target" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1 || true)
+            if [ -n "$PROXY_IP" ]; then
+              echo "✅ 代理工作正常，出口 IP: $PROXY_IP"
+              break
+            fi
+          done
+
+          if [ -z "$PROXY_IP" ]; then
+            echo "⚠️ 代理测试失败（可能目标网站不可达或节点延迟较高），Xray 诊断日志:"
+            tail -n 25 xray.log || true
           fi
 
       - name: 执行自动登录+服务器保活脚本
@@ -113,7 +119,7 @@ jobs:
           DISCORD_CLIENT_ID:    ${{ secrets.DISCORD_CLIENT_ID }}
           DISCORD_REDIRECT_URI: ${{ secrets.DISCORD_REDIRECT_URI }}
           EXPIRE_DATE:          ${{ secrets.EXPIRE_DATE }}
-          PROXY_URL:            'socks5://127.0.0.1:10808'
+          PROXY_URL:            'socks5h://127.0.0.1:10808'
           PANEL_API_KEY:        ${{ secrets.PANEL_API_KEY }}
           PANEL_SERVER_ID:      ${{ secrets.PANEL_SERVER_ID }}
           PANEL_URL:            "https://control.optiklink.net"
@@ -127,7 +133,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NEW_CID:  ${{ steps.login.outputs.new_client_id }}
         run: |
-          echo "检测到新 client_id，正在自动更新 Secret..."
+          echo "检测到新 client_id: $NEW_CID，正在自动更新 Secret..."
           gh secret set DISCORD_CLIENT_ID --body "$NEW_CID" --repo "$GITHUB_REPOSITORY"
           echo "✅ Secret DISCORD_CLIENT_ID 已自动更新"
 
@@ -144,7 +150,8 @@ jobs:
             echo "无变化，无需提交"
           else
             git commit -m "⏱️ 更新时间文件: $(date +'%Y-%m-%d %H:%M:%S')"
-            git push origin HEAD:main
+            git pull --rebase origin main || true
+            git push origin HEAD:main || true
           fi
 
   cleanup-old-runs:
