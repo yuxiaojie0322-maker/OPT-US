@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-从 VLESS 链接生成 Xray 配置文件 (已修复 REALITY 规范与监听配置)
+从 VLESS 链接生成 Xray 配置文件
 """
 
 import urllib.parse
@@ -59,7 +59,7 @@ def parse_vless(vless_url):
         "sni": params.get('sni', address),
         "fingerprint": params.get('fp', 'chrome'),
         "flow": params.get('flow', ''),
-        "pbk": params.get('pbk', '').replace('o1Ighy', 'o1lghy') if params.get('pbk', '').startswith('o1Ighy') else params.get('pbk', ''),
+        "pbk": params.get('pbk', ''),
         "sid": params.get('sid', ''),
         "raw": vless_url
     }
@@ -74,7 +74,6 @@ def generate_xray_config(vless_url):
         },
         "inbounds": [
             {
-                "listen": "127.0.0.1",
                 "port": 10808,
                 "protocol": "socks",
                 "settings": {
@@ -136,14 +135,13 @@ def generate_xray_config(vless_url):
             "allowInsecure": False
         }
     elif node["security"] == "reality":
-        reality_settings = {
+        config["outbounds"][0]["streamSettings"]["realitySettings"] = {
             "serverName": node["sni"],
             "fingerprint": node["fingerprint"],
-            "publicKey": node.get("pbk", "")
+            "publicKey": node.get("pbk", ""),
+            "shortId": node.get("sid", ""),
+            "allowInsecure": False
         }
-        if node.get("sid"):
-            reality_settings["shortId"] = node.get("sid")
-        config["outbounds"][0]["streamSettings"]["realitySettings"] = reality_settings
     
     return config
 
